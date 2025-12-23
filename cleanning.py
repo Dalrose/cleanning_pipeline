@@ -5,13 +5,13 @@ import numpy as np
 from pyspark.sql.functions import (
     col, length, trim, size, split, regexp_replace, when, lit, expr, lower, count, udf
 )
-from pyspark.sql.types import StringType, IntegerType, ArrayType, StructType, StructField
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from pyspark.sql.types import *
 import unicodedata
-import fasttext
+from langdetect import detect, detect_langs, DetectorFactory
 import nltk
 import re
-
+from transformers import AutoTokenizer, AutoModelForCausalLM
+nltk.data.path.append('/RLS002/Pretrain_NFS/nltk_data')
 start = time.time()
 
 spark = SparkSession.builder \
@@ -25,6 +25,7 @@ input_path = "/RLS002/Pretrain_NFS/dataset/PleIAs/YouTube-Commons/cctube_28.parq
 output_path = "/RLS002/Pretrain_NFS/dataset/PleIAs/YouTube-Commons-Cleaned/cctube_28.parquet"
 
 df = spark.read.parquet(input_path).withColumn("content", trim(col("text")))
+df = df.withColumn("score", lit(1))
 
 # =====================
 # Content status: 文本内部去重
@@ -88,12 +89,11 @@ df = df.withColumn(
     .otherwise(col("score"))
 )
 
-df = df.filter(col("score") != 0)
-
 # =====================
 # Language status
 # =====================
-model = fasttext.load_model("lid.176.bin")
+DetectorFactory.seed = 0  # 保证结果可复现
+
 def language_status(text, transcription_language=None, threshold=0.2):
     if not text:
         return "clean"
@@ -104,13 +104,19 @@ def language_status(text, transcription_language=None, threshold=0.2):
     
     lang_counts = {}
     for sent in sentences:
-        lang = model.predict(sent)[0][0]
+        try:
+            lang = detect(sent)  # 返回 'en', 'fr', 'zh', ...
+        except:
+            lang = "unknown"
         lang_counts[lang] = lang_counts.get(lang, 0) + 1
-    
+
     total = sum(lang_counts.values())
     main_lang = max(lang_counts, key=lang_counts.get)
     main_lang_ratio = lang_counts[main_lang] / total
     mix_ratio = 1 - main_lang_ratio
+
+    if transcription_language is None:
+        transcription_language = main_lang
 
     if mix_ratio >= threshold:
         return "mix"
@@ -131,29 +137,51 @@ df = df.withColumn(
     when(col("language_status") == "conflicted", lit(0)).otherwise(col("score"))
 )
 
+df = df.filter(col("score") != 0)
+
 # =====================
 # Safety + Topic Clarity + Unreadability
 # =====================
-model_name = "meta-llama/Meta-Llama-Guard-2-8B"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.float16,
-    device_map="auto"
-)
+safety_schema = StructType(list(df.schema.fields) + [
+    StructField("safety_flag", StringType(), True),
+    StructField("topic_clarity", StringType(), True),
+    StructField("unreadability", StringType(), True),
+    StructField("readability_safety_clarity", IntegerType(), True)  # 中间列，用于计算最终 score
+])
+_generator = None
+_tokenizer = None
 
+def get_generator(model_path, dtype="float16", device="cuda"):
+    global _generator, _tokenizer
+    if _generator is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _tokenizer = AutoTokenizer.from_pretrained(model_path)
+        _generator = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=getattr(torch, dtype)
+        ).to(device)
+    return _generator, _tokenizer
 
-def safety_topic_unreadability_batch(pdf_iter, batch_size=16):
+def generate_batch(prompts, model_path, max_length=256, batch_size=4, device="cuda"):
+    model, tokenizer = get_generator(model_path, dtype="float16", device=device)
     results = []
+    for i in range(0, len(prompts), batch_size):
+        batch_texts = prompts[i:i+batch_size]
+        inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True).to(device)
+        outputs = model.generate(**inputs, max_new_tokens=max_length)
+        for output in outputs:
+            decoded = tokenizer.decode(output, skip_special_tokens=True)
+            results.append(decoded)
+    return results
+
+def safety_topic_unreadability_batch(pdf_iter, batch_size=8):
+    model_path = "/home/fangyi/.cache/huggingface/hub/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c"
     for pdf in pdf_iter:
         texts = pdf['content'].tolist()
-        safety_flags = []
-        topic_clarities = []
-        unreadabilities = []
+        safety_flags, topic_clarities, unreadabilities = [], [], []
 
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i:i+batch_size]
-
             prompts = [f"""
 Classify the following text into three categories: Safety, Topic Clarity, and Readability.
 The text may be in any language. Do NOT translate it.
@@ -177,59 +205,70 @@ Text:
 Answer format (comma-separated, only one word each):
 SAFETY, TOPIC, READABILITY
 """ for text in batch_texts]
-
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
-            outputs = model.generate(**inputs, max_new_tokens=64, do_sample=False)
-
-            decoded_list = [tokenizer.decode(o, skip_special_tokens=True).lower() for o in outputs]
+            decoded_list = generate_batch(prompts, model_path=model_path)
 
             for decoded in decoded_list:
-                # Safety
-                safety_flag = "unsafe" if "unsafe" in decoded else "safe"
-
-                # Topic clarity
+                decoded = decoded.lower()
+                safety_flags.append("unsafe" if "unsafe" in decoded else "safe")
                 if "none" in decoded:
-                    topic_clarity = "none"
+                    topic_clarities.append("none")
                 elif "unclear" in decoded:
-                    topic_clarity = "unclear"
+                    topic_clarities.append("unclear")
                 else:
-                    topic_clarity = "clear"
-
-                # Readability
-                unreadability = "unreadable" if "unreadable" in decoded else "readable"
-
-                safety_flags.append(safety_flag)
-                topic_clarities.append(topic_clarity)
-                unreadabilities.append(unreadability)
+                    topic_clarities.append("clear")
+                unreadabilities.append("unreadable" if "unreadable" in decoded else "readable")
 
         pdf['safety_flag'] = safety_flags
         pdf['topic_clarity'] = topic_clarities
         pdf['unreadability'] = unreadabilities
-
-        pdf['score'] = pdf.apply(
-            lambda row: 0 if (row['safety_flag']=='unsafe' or row['topic_clarity']=='none' or row['unreadability']=='unreadable') else 1,
+        pdf['readability_safety_clarity'] = pdf.apply(
+            lambda row: 0 if (row['safety_flag']=='unsafe' 
+                            or row['topic_clarity']=='none' 
+                            or row['unreadability']=='unreadable')
+                        else 1 if (row['safety_flag']=='safe' 
+                                and row['topic_clarity']=='unclear' 
+                                and row['unreadability']=='readable')
+                        else 2,
             axis=1
         )
-
         yield pdf
 
-df = df.mapInPandas(safety_topic_unreadability_batch, schema=safety_schema.add(StructField("score", IntegerType())))
+df = df.mapInPandas(safety_topic_unreadability_batch, schema=safety_schema)
 
 # =====================
 # Score
 # =====================
 df = df.filter(col("score") != 0)
-
 df = df.withColumn(
     "score",
     when(
+        (col("text_dominance") == "none") |
+        (col("language_status") == "conflicted") |
+        (col("readability_safety_clarity") == 0),
+        lit(0)
+    )
+    .when(
         (col("text_dominance") == "weak") |
         (col("language_status") == "mix") |
-        (col("topic_clarity") == "unclear"),
+        (col("readability_safety_clarity") == 1),
         lit(1)
     )
     .otherwise(lit(2))
 )
+
+# 展示前 10 条样本
+df_sample = df.select(
+    "content",
+    "score",
+    "readability_safety_clarity",
+    "safety_flag",
+    "topic_clarity",
+    "unreadability",
+    "language_status",
+    "text_dominance"
+).limit(10)
+
+df_sample.show(truncate=200)
 
 df.write.mode("overwrite").parquet(output_path)
 
