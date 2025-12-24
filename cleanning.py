@@ -92,52 +92,52 @@ df = df.withColumn(
 # =====================
 # Language status
 # =====================
-DetectorFactory.seed = 0  # 保证结果可复现
+# DetectorFactory.seed = 0  # 保证结果可复现
 
-def language_status(text, transcription_language=None, threshold=0.2):
-    if not text:
-        return "clean"
+# def language_status(text, transcription_language=None, threshold=0.2):
+#     if not text:
+#         return "clean"
     
-    sentences = nltk.sent_tokenize(text)
-    if not sentences:
-        sentences = [text]
+#     sentences = nltk.sent_tokenize(text)
+#     if not sentences:
+#         sentences = [text]
     
-    lang_counts = {}
-    for sent in sentences:
-        try:
-            lang = detect(sent)  # 返回 'en', 'fr', 'zh', ...
-        except:
-            lang = "unknown"
-        lang_counts[lang] = lang_counts.get(lang, 0) + 1
+#     lang_counts = {}
+#     for sent in sentences:
+#         try:
+#             lang = detect(sent)  # 返回 'en', 'fr', 'zh', ...
+#         except:
+#             lang = "unknown"
+#         lang_counts[lang] = lang_counts.get(lang, 0) + 1
 
-    total = sum(lang_counts.values())
-    main_lang = max(lang_counts, key=lang_counts.get)
-    main_lang_ratio = lang_counts[main_lang] / total
-    mix_ratio = 1 - main_lang_ratio
+#     total = sum(lang_counts.values())
+#     main_lang = max(lang_counts, key=lang_counts.get)
+#     main_lang_ratio = lang_counts[main_lang] / total
+#     mix_ratio = 1 - main_lang_ratio
 
-    if transcription_language is None:
-        transcription_language = main_lang
+#     if transcription_language is None:
+#         transcription_language = main_lang
 
-    if mix_ratio >= threshold:
-        return "mix"
-    elif transcription_language != main_lang:
-        return "conflicted"
-    else:
-        return "clean"
+#     if mix_ratio >= threshold:
+#         return "mix"
+#     elif transcription_language != main_lang:
+#         return "conflicted"
+#     else:
+#         return "clean"
 
-language_status_udf = udf(language_status, StringType())
+# language_status_udf = udf(language_status, StringType())
 
-df = df.withColumn(
-    "language_status",
-    language_status_udf(col("content"), col("transcription_language"))
-)
+# df = df.withColumn(
+#     "language_status",
+#     language_status_udf(col("content"), col("transcription_language"))
+# )
 
-df = df.withColumn(
-    "score",
-    when(col("language_status") == "conflicted", lit(0)).otherwise(col("score"))
-)
+# df = df.withColumn(
+#     "score",
+#     when(col("language_status") == "conflicted", lit(0)).otherwise(col("score"))
+# )
 
-df = df.filter(col("score") != 0)
+# df = df.filter(col("score") != 0)
 
 # =====================
 # Safety + Topic Clarity + Unreadability
@@ -243,13 +243,13 @@ df = df.withColumn(
     "score",
     when(
         (col("text_dominance") == "none") |
-        (col("language_status") == "conflicted") |
+        # (col("language_status") == "conflicted") |
         (col("readability_safety_clarity") == 0),
         lit(0)
     )
     .when(
         (col("text_dominance") == "weak") |
-        (col("language_status") == "mix") |
+        # (col("language_status") == "mix") |
         (col("readability_safety_clarity") == 1),
         lit(1)
     )
@@ -264,7 +264,7 @@ df_sample = df.select(
     "safety_flag",
     "topic_clarity",
     "unreadability",
-    "language_status",
+    # "language_status",
     "text_dominance"
 ).limit(10)
 
